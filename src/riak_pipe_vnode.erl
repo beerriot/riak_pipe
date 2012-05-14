@@ -42,6 +42,7 @@
          queue_work/3,
          queue_work/4,
          queue_work/5,
+         queue_work_list/2,
          eoi/2,
          next_input/2,
          reply_archive/3,
@@ -120,6 +121,10 @@
                       input :: term(),
                       timeout :: qtimeout(),
                       usedpreflist :: riak_core_apl:preflist()}).
+-record(cmd_enqueue_list, {fitting :: #fitting{},
+                           inputs :: [term()],
+                           usedpreflist :: riak_core_apl:preflist(),
+                           accepted=0 :: non_neg_integer()}).
 -record(cmd_eoi, {fitting :: #fitting{}}).
 -record(cmd_next_input, {fitting :: #fitting{}}).
 -record(cmd_archive, {fitting :: #fitting{},
@@ -215,6 +220,44 @@ queue_work(Fitting, Input) ->
 queue_work(Fitting, Input, Timeout) ->
     queue_work(Fitting, Input, Timeout, []).
 
+%% @doc Queue as many of `Inputs' as will fit in the queues.  Returns
+%% the list of inputs that did not fit.
+queue_work_list(Fitting, Inputs) ->
+    InputBins = bin_inputs(Fitting, Inputs),
+    lager:debug("~b input bins, min=~b, max=~b",
+                [length(InputBins),
+                 lists:min([length(I) || {_, I} <- InputBins]),
+                 lists:max([length(I) || {_, I} <- InputBins])]),
+    lists:flatten([ queue_work_list(Fitting, I, [])
+                    || {_, I} <- InputBins ]).
+
+bin_inputs(Fitting, Inputs) ->
+    lists:foldr(
+      fun(I, Acc) ->
+              P = remaining_preflist(
+                    I, work_hash(Fitting, I), 1, []),
+              case lists:keytake(P, 1, Acc) of
+                  {value, {_, RestI}, NewAcc} ->
+                      [{P,[I|RestI]}|NewAcc];
+                  false ->
+                      [{P, [I]}|Acc]
+              end
+      end,
+      [],
+      Inputs).
+
+work_hash(#fitting{chashfun=follow}, _Input) ->
+    %% this should only happen if someone sets up a pipe with
+    %% the first fitting as chashfun=follow
+    any_local_vnode();
+work_hash(#fitting{chashfun={Module, Function}}, Input) ->
+    Module:Function(Input);
+work_hash(#fitting{chashfun=Hash}, _Input) when not is_function(Hash) ->
+    Hash;
+work_hash(#fitting{chashfun=HashFun}, Input) ->
+    %% 1.0.x compatibility
+    riak_pipe_fun:compat_apply(HashFun, [Input]).
+
 %% @doc Queue the given `Input' for processing by the `Fitting'.  This
 %%      function handles getting the input to the correct vnode by
 %%      evaluating the fitting's consistent-hashing function
@@ -222,23 +265,13 @@ queue_work(Fitting, Input, Timeout) ->
 -spec queue_work(riak_pipe:fitting(), term(), qtimeout(),
                  riak_core_apl:preflist()) ->
          ok | {error, [qerror()]}.
-queue_work(#fitting{chashfun=follow}=Fitting,
-           Input, Timeout, UsedPreflist) ->
-    %% this should only happen if someone sets up a pipe with
-    %% the first fitting as chashfun=follow
-    queue_work(Fitting, Input, Timeout, UsedPreflist, any_local_vnode());
-queue_work(#fitting{chashfun={Module, Function}}=Fitting,
-           Input, Timeout, UsedPreflist) ->
+queue_work(Fitting, Input, Timeout, UsedPreflist) ->
     queue_work(Fitting, Input, Timeout, UsedPreflist,
-               Module:Function(Input));
-queue_work(#fitting{chashfun=Hash}=Fitting,
-           Input, Timeout, UsedPreflist) when not is_function(Hash) ->
-    queue_work(Fitting, Input, Timeout, UsedPreflist, Hash);
-queue_work(#fitting{chashfun=HashFun}=Fitting,
-           Input, Timeout, UsedPreflist) ->
-    %% 1.0.x compatibility
-    Hash = riak_pipe_fun:compat_apply(HashFun, [Input]),
-    queue_work(Fitting, Input, Timeout, UsedPreflist, Hash).
+               work_hash(Fitting, Input)).
+
+queue_work_list(Fitting, [I|_]=Inputs, UsedPreflist) ->
+    queue_work_list(Fitting, Inputs, UsedPreflist,
+                    work_hash(Fitting, I)).
 
 %% @doc Queue the given `Input' for processing the the `Fitting' on
 %%      the vnode specified by `Hash'.  This version of the function
@@ -264,6 +297,30 @@ queue_work(#fitting{chashfun=HashFun}=Fitting,
          ok | {error, [qerror()]}.
 queue_work(Fitting, Input, Timeout, UsedPreflist, Hash) ->
     queue_work_erracc(Fitting, Input, Timeout, UsedPreflist, Hash, []).
+
+queue_work_list(#fitting{nval=NVal}=Fitting,
+                [I|_]=Inputs, UsedPreflist, Hash) ->
+    case remaining_preflist(I, Hash, NVal, UsedPreflist) of
+        [NextPref|_] ->
+            case queue_work_send_list(Fitting, Inputs,
+                                      [NextPref|UsedPreflist]) of
+                {ok, Accepted} ->
+                    case lists:nthtail(Accepted, Inputs) of
+                        [] ->
+                            [];
+                        Rest ->
+                            queue_work_list(
+                              Fitting, Rest,
+                              [NextPref|UsedPreflist], Hash)
+                    end;
+                {error, _Error} ->
+                    queue_work_list(
+                      Fitting, Inputs, [NextPref|UsedPreflist], Hash)
+            end;
+        [] ->
+            Inputs
+    end.
+
 
 %% @doc Internal implementation of queue_work, to accumulate errors
 %%      returned by each failed vnode enqueue for cumulative failure
@@ -332,6 +389,31 @@ queue_work_send(#fitting{ref=Ref}=Fitting,
       {Index, Node},
       #cmd_enqueue{fitting=Fitting, input=Input, timeout=Timeout,
                    usedpreflist=UsedPreflist},
+      {raw, Ref, self()},
+      riak_pipe_vnode_master) of
+        {ok, VnodePid} ->
+            %% monitor in case the vnode is gone before it
+            %% responds to this request
+            MonRef = erlang:monitor(process, VnodePid),
+            %% block until input confirmed queued, for backpressure
+            receive
+                {Ref, Reply} ->
+                    erlang:demonitor(MonRef),
+                    Reply;
+                {'DOWN',MonRef,process,VnodePid,Reason} ->
+                    {error, {vnode_down, Reason}}
+            end
+    catch exit:{{nodedown, Node}, _GenServerCall} ->
+            %% node died between services check and gen_server:call
+            {error, {nodedown, Node}}
+    end.
+
+queue_work_send_list(#fitting{ref=Ref}=Fitting,
+                     Inputs, [{Index,Node}|_]=UsedPreflist) ->
+    try riak_core_vnode_master:command_return_vnode(
+      {Index, Node},
+      #cmd_enqueue_list{fitting=Fitting, inputs=Inputs,
+                        usedpreflist=UsedPreflist},
       {raw, Ref, self()},
       riak_pipe_vnode_master) of
         {ok, VnodePid} ->
@@ -465,6 +547,8 @@ handle_command(ping, _Sender, State) ->
     {reply, {pong, State#state.partition}, State};
 handle_command(#cmd_enqueue{}=Cmd, Sender, State) ->
     enqueue_internal(Cmd, Sender, State);
+handle_command(#cmd_enqueue_list{}=Cmd, Sender, State) ->
+    enqueue_internal(Cmd, Sender, State);
 handle_command(#cmd_eoi{}=Cmd, _Sender, State) ->
     eoi_internal(Cmd, State);
 handle_command(#cmd_next_input{}=Cmd, _Sender, State) ->
@@ -485,6 +569,16 @@ handle_handoff_command(?FOLD_REQ{}=Cmd, Sender, State) ->
 handle_handoff_command(#cmd_archive{}=Cmd, _Sender, State) ->
     archive_internal(Cmd, State);
 handle_handoff_command(#cmd_enqueue{fitting=F}=Cmd, Sender,
+                       #state{handoff=#handoff{}}=State) ->
+    case worker_by_fitting(F, State) of
+        {ok, _} ->
+            %% not yet handed off: proceed
+            handle_command(Cmd, Sender, State);
+        none ->
+            %% handed off, or never existed: forward
+            {forward, State}
+    end;
+handle_handoff_command(#cmd_enqueue_list{fitting=F}=Cmd, Sender,
                        #state{handoff=#handoff{}}=State) ->
     case worker_by_fitting(F, State) of
         {ok, _} ->
@@ -677,6 +771,27 @@ handle_coverage(_Request, _KeySpaces, _Sender, State) ->
           ok | {error, qerror()},
           state()}
        | {noreply, state()}.
+enqueue_internal(#cmd_enqueue_list{inputs=[], accepted=A},
+                 _Sender, State) ->
+    {reply, {ok, A}, State};
+enqueue_internal(#cmd_enqueue_list{inputs=[I|Rest], accepted=A}=Cmd,
+                 Sender, State) ->
+    Single = #cmd_enqueue{fitting=Cmd#cmd_enqueue_list.fitting,
+                          input=I,
+                          timeout=noblock,
+                          usedpreflist=Cmd#cmd_enqueue_list.usedpreflist},
+    case enqueue_internal(Single, Sender, State) of
+        {reply, {error, timeout}, NewState} ->
+            %% queue is full - stop here
+            {reply, {ok, A}, NewState};
+        {reply, ok, NewState} ->
+            enqueue_internal(Cmd#cmd_enqueue_list{inputs=Rest,
+                                                  accepted=A+1},
+                             Sender, NewState);
+        {reply, {error, E}, NewState} ->
+            {reply, {error, E}, NewState}
+%%% ignoring noreply case, since timeout=noblock should never hit it
+    end;
 enqueue_internal(#cmd_enqueue{fitting=Fitting, input=Input, timeout=TO,
                               usedpreflist=UsedPreflist},
                  Sender, #state{partition=Partition}=State) ->

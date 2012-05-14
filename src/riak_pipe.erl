@@ -59,6 +59,7 @@
          collect_results/2,
          queue_work/2,
          queue_work/3,
+         queue_work_list/2,
          eoi/1,
          destroy/1,
          status/1,
@@ -264,6 +265,12 @@ eoi(#pipe{fittings=[{_,Head}|_]}) ->
 %% @equiv queue_work(Pipe, Input, infinity)
 queue_work(Pipe, Input) ->
     queue_work(Pipe, Input, infinity).
+
+%% @doc Queue a list of inputs.  As many inputs as can be enqueued
+%% without blocking will be.  The return value contains a list of the
+%% inputs that could not fit in the queues.
+queue_work_list(#pipe{fittings=[{_,Head}|_]}, Inputs) ->
+    riak_pipe_vnode:queue_work_list(Head, Inputs).
 
 %% @doc Send inputs to the head of the pipe.
 %%

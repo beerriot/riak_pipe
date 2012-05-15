@@ -138,7 +138,8 @@
          send_archive/1,
          send_output/3,
          send_output/4,
-         send_output/5]).
+         send_output/5,
+         send_output_list/3]).
 -export([behaviour_info/1]).
 
 %% gen_fsm callbacks
@@ -209,6 +210,24 @@ send_archive(WorkerPid) ->
 %% @equiv send_output(Output, FromPartition, Details, infinity)
 send_output(Output, FromPartition, Details) ->
     send_output(Output, FromPartition, Details, infinity).
+
+send_output_list(Outputs, FromPartition,
+                 #fitting_details{output=Fitting, name=Name}) ->
+    case Fitting#fitting.chashfun of
+        sink ->
+            [ riak_pipe_sink:result(Name, Fitting, Output)
+              || Output <- Outputs ],
+            ok;
+        follow ->
+            %% TODO: should 'follow' use the original preflist (in
+            %%       case of failover)?
+            riak_pipe_vnode:queue_work_list(
+              Fitting, Outputs, [],
+              riak_pipe_vnode:hash_for_partition(FromPartition));
+        _ ->
+            riak_pipe_vnode:queue_work_list(Fitting, Outputs)
+    end.
+    
 
 %% @doc Send output from the given fitting to the next output down the
 %%      line. `FromPartition' is used in the case that the next

@@ -43,6 +43,8 @@
          queue_work/4,
          queue_work/5,
          queue_work_list/2,
+         queue_work_list/3,
+         queue_work_list/4,
          eoi/2,
          next_input/2,
          reply_archive/3,

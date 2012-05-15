@@ -300,26 +300,23 @@ queue_work(Fitting, Input, Timeout, UsedPreflist, Hash) ->
 
 queue_work_list(#fitting{nval=NVal}=Fitting,
                 [I|_]=Inputs, UsedPreflist, Hash) ->
-    case remaining_preflist(I, Hash, NVal, UsedPreflist) of
-        [NextPref|_] ->
-            case queue_work_send_list(Fitting, Inputs,
-                                      [NextPref|UsedPreflist]) of
-                {ok, Accepted} ->
-                    case lists:nthtail(Accepted, Inputs) of
-                        [] ->
-                            [];
-                        Rest ->
-                            queue_work_list(
-                              Fitting, Rest,
-                              [NextPref|UsedPreflist], Hash)
-                    end;
-                {error, _Error} ->
-                    queue_work_list(
-                      Fitting, Inputs, [NextPref|UsedPreflist], Hash)
+    Preflist = remaining_preflist(I, Hash, NVal, UsedPreflist),
+    queue_work_listp(Fitting, Inputs, UsedPreflist, Preflist).
+
+queue_work_listp(Fitting, Inputs, UsedPreflist, [NextPref|RestPref]) ->
+    case queue_work_send_list(Fitting, Inputs, [NextPref|UsedPreflist]) of
+        {ok, Accepted} ->
+            case lists:nthtail(Accepted, Inputs) of
+                [] ->
+                    [];
+                Rest ->
+                    queue_work_listp(Fitting, Rest, UsedPreflist, RestPref)
             end;
-        [] ->
-            Inputs
-    end.
+        {error, _Error} ->
+            queue_work_listp(Fitting, Inputs, UsedPreflist, RestPref)
+    end;
+queue_work_listp(_, Inputs, _, []) ->
+    Inputs.
 
 
 %% @doc Internal implementation of queue_work, to accumulate errors

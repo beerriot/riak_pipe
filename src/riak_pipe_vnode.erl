@@ -226,10 +226,6 @@ queue_work(Fitting, Input, Timeout) ->
 %% the list of inputs that did not fit.
 queue_work_list(Fitting, Inputs) ->
     InputBins = bin_inputs(Fitting, Inputs),
-    lager:debug("~b input bins, min=~b, max=~b",
-                [length(InputBins),
-                 lists:min([length(I) || {_, I} <- InputBins]),
-                 lists:max([length(I) || {_, I} <- InputBins])]),
     lists:flatten([ queue_work_list(Fitting, I, [])
                     || {_, I} <- InputBins ]).
 

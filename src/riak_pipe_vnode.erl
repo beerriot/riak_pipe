@@ -223,11 +223,16 @@ queue_work(Fitting, Input, Timeout) ->
     queue_work(Fitting, Input, Timeout, []).
 
 %% @doc Queue as many of `Inputs' as will fit in the queues.  Returns
-%% the list of inputs that did not fit.
+%% the list of inputs that did not fit, and errors encountered along
+%% the way.
+-spec queue_work_list(riak_pipe:fitting(), [term()]) ->
+        {[term()], [qerror()]}.
 queue_work_list(Fitting, Inputs) ->
     InputBins = bin_inputs(Fitting, Inputs),
-    lists:flatten([ queue_work_list(Fitting, I, [])
-                    || {_, I} <- InputBins ]).
+    Results = [ queue_work_list(Fitting, I, [])
+                || {_, I} <- InputBins ],
+    {Leftover, Errors} = lists:unzip(Results),
+    {lists:append(Leftover), lists:append(Errors)}.
 
 bin_inputs(Fitting, Inputs) ->
     lists:foldr(
@@ -299,23 +304,32 @@ queue_work(Fitting, Input, Timeout, UsedPreflist, Hash) ->
 queue_work_list(#fitting{nval=NVal}=Fitting,
                 [I|_]=Inputs, UsedPreflist, Hash) ->
     Preflist = remaining_preflist(I, Hash, NVal, UsedPreflist),
-    queue_work_listp(Fitting, Inputs, UsedPreflist, Preflist).
+    queue_work_listp(Fitting, Inputs, UsedPreflist, Preflist, []);
+queue_work_list(_, [], _, _) ->
+    %% avoid bad match in function clause if there are no inputs
+    {[], []}.  % no inputs left, no errors
 
-queue_work_listp(Fitting, Inputs, UsedPreflist, [NextPref|RestPref]) ->
+
+queue_work_listp(Fitting, Inputs, UsedPreflist,
+                 [NextPref|RestPref], ErrAcc) ->
     case queue_work_send_list(Fitting, Inputs, [NextPref|UsedPreflist]) of
         {ok, Accepted} ->
             case lists:nthtail(Accepted, Inputs) of
                 [] ->
-                    [];
+                    %% TODO: if all inputs were successfully enqueued,
+                    %% do the errors matter?
+                    {[],ErrAcc};
                 Rest ->
-                    queue_work_listp(Fitting, Rest, UsedPreflist, RestPref)
+                    queue_work_listp(
+                      Fitting, Rest, UsedPreflist, RestPref, ErrAcc)
             end;
-        {error, _Error} ->
-            queue_work_listp(Fitting, Inputs, UsedPreflist, RestPref)
+        {error, Error} ->
+            %% TODO: are there errors that we should not continue after?
+            queue_work_listp(
+              Fitting, Inputs, UsedPreflist, RestPref, [Error|ErrAcc])
     end;
-queue_work_listp(_, Inputs, _, []) ->
-    Inputs.
-
+queue_work_listp(_, Inputs, _, [], ErrAcc) ->
+    {Inputs, ErrAcc}.
 
 %% @doc Internal implementation of queue_work, to accumulate errors
 %%      returned by each failed vnode enqueue for cumulative failure

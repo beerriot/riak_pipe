@@ -268,7 +268,8 @@ queue_work(Pipe, Input) ->
 
 %% @doc Queue a list of inputs.  As many inputs as can be enqueued
 %% without blocking will be.  The return value contains a list of the
-%% inputs that could not fit in the queues.
+%% inputs that could not fit in the queues and a list of errors that
+%% were encountered while enqueueing.
 queue_work_list(#pipe{fittings=[{_,Head}|_]}, Inputs) ->
     riak_pipe_vnode:queue_work_list(Head, Inputs).
 

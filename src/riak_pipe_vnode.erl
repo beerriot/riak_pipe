@@ -43,7 +43,6 @@
          queue_work/4,
          queue_work/5,
          queue_work_list/2,
-         queue_work_list/3,
          queue_work_list/4,
          eoi/2,
          next_input/2,
@@ -229,8 +228,8 @@ queue_work(Fitting, Input, Timeout) ->
         {[term()], [qerror()]}.
 queue_work_list(Fitting, Inputs) ->
     InputBins = bin_inputs(Fitting, Inputs),
-    Results = [ queue_work_list(Fitting, I, [])
-                || {_, I} <- InputBins ],
+    Results = [ queue_work_list(Fitting, Bin, [], work_hash(Fitting, I))
+                || {_, [I|_]=Bin} <- InputBins ],
     {Leftover, Errors} = lists:unzip(Results),
     {lists:append(Leftover), lists:append(Errors)}.
 
@@ -271,10 +270,6 @@ work_hash(#fitting{chashfun=HashFun}, Input) ->
 queue_work(Fitting, Input, Timeout, UsedPreflist) ->
     queue_work(Fitting, Input, Timeout, UsedPreflist,
                work_hash(Fitting, Input)).
-
-queue_work_list(Fitting, [I|_]=Inputs, UsedPreflist) ->
-    queue_work_list(Fitting, Inputs, UsedPreflist,
-                    work_hash(Fitting, I)).
 
 %% @doc Queue the given `Input' for processing the the `Fitting' on
 %%      the vnode specified by `Hash'.  This version of the function

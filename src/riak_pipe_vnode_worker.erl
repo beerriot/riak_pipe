@@ -217,7 +217,7 @@ send_output_list(Outputs, FromPartition,
         sink ->
             [ riak_pipe_sink:result(Name, Fitting, Output)
               || Output <- Outputs ],
-            ok;
+            {[], []}; % no leftover inputs, no errors
         follow ->
             %% TODO: should 'follow' use the original preflist (in
             %%       case of failover)?

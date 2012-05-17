@@ -228,16 +228,18 @@ queue_work(Fitting, Input, Timeout) ->
         {[term()], [qerror()]}.
 queue_work_list(Fitting, Inputs) ->
     InputBins = bin_inputs(Fitting, Inputs),
-    Results = [ queue_work_list(Fitting, Bin, [], work_hash(Fitting, I))
+    Results = [ queue_work_list(Fitting, Bin, [],
+                                work_hash(Fitting, I))
                 || {_, [I|_]=Bin} <- InputBins ],
     {Leftover, Errors} = lists:unzip(Results),
     {lists:append(Leftover), lists:append(Errors)}.
 
 bin_inputs(Fitting, Inputs) ->
+    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     lists:foldr(
       fun(I, Acc) ->
-              P = remaining_preflist(
-                    I, work_hash(Fitting, I), 1, []),
+              P = riak_core_ring:responsible_index(
+                    work_hash(Fitting, I), Ring),
               case lists:keytake(P, 1, Acc) of
                   {value, {_, RestI}, NewAcc} ->
                       [{P,[I|RestI]}|NewAcc];

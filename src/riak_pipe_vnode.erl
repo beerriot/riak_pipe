@@ -226,13 +226,39 @@ queue_work(Fitting, Input, Timeout) ->
 %% the way.
 -spec queue_work_list(riak_pipe:fitting(), [term()]) ->
         {[term()], [qerror()]}.
-queue_work_list(Fitting, Inputs) ->
+queue_work_list(#fitting{nval=NVal}=Fitting, Inputs) ->
     InputBins = bin_inputs(Fitting, Inputs),
-    Results = [ queue_work_list(Fitting, Bin, [],
-                                work_hash(Fitting, I))
-                || {_, [I|_]=Bin} <- InputBins ],
-    {Leftover, Errors} = lists:unzip(Results),
+    PlistBins = [ {remaining_preflist(I, work_hash(Fitting, I), NVal, []),
+                   Bin, []}
+                  || {_, [I|_]=Bin} <- InputBins ],
+    Results = queue_work_bins(Fitting, PlistBins),
+    {_, Leftover, Errors} = lists:unzip3(Results),
     {lists:append(Leftover), lists:append(Errors)}.
+
+queue_work_bins(Fitting, Bins) ->
+    {NewBins, Done} =
+        lists:mapfoldr(
+          fun({[], _, _}=B, Done) -> {B, Done};
+             ({_, [], _}=B, Done) -> {B, Done};
+             ({[NextPref|RestPref], Inputs, Errors}, Done) ->
+                  case queue_work_listp(Fitting, Inputs, [], NextPref) of
+                      {ok, []} ->
+                          {{RestPref, [], Errors}, Done};
+                      {ok, Rest} ->
+                          {{RestPref, Rest, Errors},
+                           Done andalso RestPref==[]};
+                      {error, Error} ->
+                          {{RestPref, Inputs, [Error|Errors]},
+                           Done andalso RestPref==[]}
+                  end
+          end,
+          true,
+          Bins),
+    case Done of
+        true -> NewBins;
+        false -> queue_work_bins(Fitting, NewBins)
+    end.
+
 
 bin_inputs(Fitting, Inputs) ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
@@ -301,32 +327,16 @@ queue_work(Fitting, Input, Timeout, UsedPreflist, Hash) ->
 queue_work_list(#fitting{nval=NVal}=Fitting,
                 [I|_]=Inputs, UsedPreflist, Hash) ->
     Preflist = remaining_preflist(I, Hash, NVal, UsedPreflist),
-    queue_work_listp(Fitting, Inputs, UsedPreflist, Preflist, []);
-queue_work_list(_, [], _, _) ->
-    %% avoid bad match in function clause if there are no inputs
-    {[], []}.  % no inputs left, no errors
+    {_, Rest, Errors} = queue_work_bins(Fitting, [{Preflist, Inputs, []}]),
+    {Rest, Errors}.
 
-
-queue_work_listp(Fitting, Inputs, UsedPreflist,
-                 [NextPref|RestPref], ErrAcc) ->
+queue_work_listp(Fitting, Inputs, UsedPreflist, NextPref) ->
     case queue_work_send_list(Fitting, Inputs, [NextPref|UsedPreflist]) of
         {ok, Accepted} ->
-            case lists:nthtail(Accepted, Inputs) of
-                [] ->
-                    %% TODO: if all inputs were successfully enqueued,
-                    %% do the errors matter?
-                    {[],ErrAcc};
-                Rest ->
-                    queue_work_listp(
-                      Fitting, Rest, UsedPreflist, RestPref, ErrAcc)
-            end;
+            {ok, lists:nthtail(Accepted, Inputs)};
         {error, Error} ->
-            %% TODO: are there errors that we should not continue after?
-            queue_work_listp(
-              Fitting, Inputs, UsedPreflist, RestPref, [Error|ErrAcc])
-    end;
-queue_work_listp(_, Inputs, _, [], ErrAcc) ->
-    {Inputs, ErrAcc}.
+            {error, Error}
+    end.
 
 %% @doc Internal implementation of queue_work, to accumulate errors
 %%      returned by each failed vnode enqueue for cumulative failure

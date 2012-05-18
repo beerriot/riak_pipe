@@ -77,6 +77,10 @@
                 | timeout
                 | forwarding
                 | preflist_exhausted.
+-type preflist_part() :: {non_neg_integer(), node()}. %% see riak_core_apl
+-type bin() :: {riak_core_apl:preflist(),
+                Inputs :: [term()],
+                Errors :: [qerror()]}.
 
 -define(DEFAULT_WORKER_LIMIT, 50).
 -define(DEFAULT_WORKER_Q_LIMIT, 4096).
@@ -221,61 +225,6 @@ queue_work(Fitting, Input) ->
 queue_work(Fitting, Input, Timeout) ->
     queue_work(Fitting, Input, Timeout, []).
 
-%% @doc Queue as many of `Inputs' as will fit in the queues.  Returns
-%% the list of inputs that did not fit, and errors encountered along
-%% the way.
--spec queue_work_list(riak_pipe:fitting(), [term()]) ->
-        {[term()], [qerror()]}.
-queue_work_list(#fitting{nval=NVal}=Fitting, Inputs) ->
-    InputBins = bin_inputs(Fitting, Inputs),
-    PlistBins = [ {remaining_preflist(I, work_hash(Fitting, I), NVal, []),
-                   Bin, []}
-                  || {_, [I|_]=Bin} <- InputBins ],
-    Results = queue_work_bins(Fitting, PlistBins),
-    {_, Leftover, Errors} = lists:unzip3(Results),
-    {lists:append(Leftover), lists:append(Errors)}.
-
-queue_work_bins(Fitting, Bins) ->
-    {NewBins, Done} =
-        lists:mapfoldr(
-          fun({[], _, _}=B, Done) -> {B, Done};
-             ({_, [], _}=B, Done) -> {B, Done};
-             ({[NextPref|RestPref], Inputs, Errors}, Done) ->
-                  case queue_work_listp(Fitting, Inputs, [], NextPref) of
-                      {ok, []} ->
-                          {{RestPref, [], Errors}, Done};
-                      {ok, Rest} ->
-                          {{RestPref, Rest, Errors},
-                           Done andalso RestPref==[]};
-                      {error, Error} ->
-                          {{RestPref, Inputs, [Error|Errors]},
-                           Done andalso RestPref==[]}
-                  end
-          end,
-          true,
-          Bins),
-    case Done of
-        true -> NewBins;
-        false -> queue_work_bins(Fitting, NewBins)
-    end.
-
-
-bin_inputs(Fitting, Inputs) ->
-    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
-    lists:foldr(
-      fun(I, Acc) ->
-              P = riak_core_ring:responsible_index(
-                    work_hash(Fitting, I), Ring),
-              case lists:keytake(P, 1, Acc) of
-                  {value, {_, RestI}, NewAcc} ->
-                      [{P,[I|RestI]}|NewAcc];
-                  false ->
-                      [{P, [I]}|Acc]
-              end
-      end,
-      [],
-      Inputs).
-
 work_hash(#fitting{chashfun=follow}, _Input) ->
     %% this should only happen if someone sets up a pipe with
     %% the first fitting as chashfun=follow
@@ -324,20 +273,6 @@ queue_work(Fitting, Input, Timeout, UsedPreflist) ->
 queue_work(Fitting, Input, Timeout, UsedPreflist, Hash) ->
     queue_work_erracc(Fitting, Input, Timeout, UsedPreflist, Hash, []).
 
-queue_work_list(#fitting{nval=NVal}=Fitting,
-                [I|_]=Inputs, UsedPreflist, Hash) ->
-    Preflist = remaining_preflist(I, Hash, NVal, UsedPreflist),
-    {_, Rest, Errors} = queue_work_bins(Fitting, [{Preflist, Inputs, []}]),
-    {Rest, Errors}.
-
-queue_work_listp(Fitting, Inputs, UsedPreflist, NextPref) ->
-    case queue_work_send_list(Fitting, Inputs, [NextPref|UsedPreflist]) of
-        {ok, Accepted} ->
-            {ok, lists:nthtail(Accepted, Inputs)};
-        {error, Error} ->
-            {error, Error}
-    end.
-
 %% @doc Internal implementation of queue_work, to accumulate errors
 %%      returned by each failed vnode enqueue for cumulative failure
 %%      return.
@@ -367,6 +302,112 @@ queue_work_erracc(#fitting{nval=NVal}=Fitting,
                     {error, ErrAcc}
             end
     end.
+
+%% @doc Queue as many of `Inputs' as will fit in the queues.  Returns
+%% the list of inputs that did not fit, and errors encountered along
+%% the way.
+-spec queue_work_list(riak_pipe:fitting(), [term()]) ->
+        {[term()], [qerror()]}.
+queue_work_list(Fitting, Inputs) ->
+    InputParts = partition_inputs(Fitting, Inputs),
+    Bins = [ partition_to_bin(Fitting, P) || P <- InputParts ],
+    Results = queue_work_bins(Fitting, Bins),
+    {_, Leftover, Errors} = lists:unzip3(Results),
+    {lists:append(Leftover), lists:append(Errors)}.
+
+%% @doc Converts the output of {@link partition_inputs/2} to the input
+%% of {@link queue_work_bins/2}.
+-spec partition_to_bin(riak_pipe:fitting(), {chash(), [term()]}) -> bin().
+partition_to_bin(#fitting{nval=NVal}=Fitting, {_Hash, [I|_]=Inputs}) ->
+    {remaining_preflist(I, work_hash(Fitting, I), NVal, []), Inputs, []}.
+
+%% @doc Queue as many of `Inputs' as will fit in the queues.  It is
+%% assumed that all of Inputs will has to the same preflist.  Return
+%% format is the same as {@link queue_work_list/2}.
+-spec queue_work_list(riak_pipe:fitting(), [term()],
+                      riak_core_apl:preflist(), chash()) ->
+        {[term()], [qerror()]}.
+queue_work_list(#fitting{nval=NVal}=Fitting,
+                [I|_]=Inputs, UsedPreflist, Hash) ->
+    Preflist = remaining_preflist(I, Hash, NVal, UsedPreflist),
+    [{_, Rest, Errors}] = queue_work_bins(Fitting, [{Preflist, Inputs, []}]),
+    {Rest, Errors}.
+
+%% @doc Queue inputs that have been binned by preflist.  Queueing is
+%% done in rounds: inputs will be enqueued at the first preflist entry
+%% for each preflist on round one, and if unqueued inputs remain, the
+%% will be sent to the second entries in each preflist during round
+%% two.  Rounds continue until all inputs are enqueued or all
+%% preflists are exhausted.
+%%
+%% This staged queueing is done in preference to queueing all inputs
+%% for a given preflist, then queueing all inputs for another
+%% preflist, etc., in an attempt at fairness. Whole-preflist enqueuing
+%% means that "later" preflists can be delayed by over-full "early"
+%% preflists.
+-spec queue_work_bins(riak_pipe:fitting(), [bin()]) -> [bin()].
+queue_work_bins(Fitting, Bins) ->
+    case lists:mapfoldr(queue_work_bin(Fitting), true, Bins) of
+        {NewBins, true}  -> NewBins;
+        {NewBins, false} -> queue_work_bins(Fitting, NewBins)
+    end.
+
+%% @doc Mapfold function for {@link queue_work_bins/2}.  `Done' here
+%% only means there's nothing more that can be done at this time, not
+%% that all inputs have been queued.
+-spec queue_work_bin(riak_pipe:fitting()) ->
+        fun( (bin(), boolean()) -> {bin(), boolean()} ).
+queue_work_bin(Fitting) ->
+    fun({[], _, _}=B, Done) ->
+            %% no more preflist to use -> done
+            {B, Done};
+       ({_, [], _}=B, Done) ->
+            %% no more inputs to queue -> done
+            {B, Done};
+       ({[NextPref|RestPref], Inputs, Errors}, Done) ->
+            case queue_work_listp(Fitting, Inputs, [], NextPref) of
+                {ok, Rest} ->
+                    {{RestPref, Rest, Errors},
+                     %% done if we're out of preflist or inputs
+                     Done andalso (RestPref==[] orelse Rest==[])};
+                {error, Error} ->
+                    {{RestPref, Inputs, [Error|Errors]},
+                     %% done if we're out of preflist
+                     Done andalso RestPref==[]}
+            end
+    end.
+
+%% @doc Attempt to queue all `Inputs' at `NextPref'.  Returns the list
+%% of inputs that didn't fit in the queue or the error that occurred.
+-spec queue_work_listp(riak_pipe:fitting(), [term()],
+                       riak_core_apl:preflist(), preflist_part()) ->
+        {ok, [term()]} | {error, qerror()}.
+queue_work_listp(Fitting, Inputs, UsedPreflist, NextPref) ->
+    case queue_work_send_list(Fitting, Inputs, [NextPref|UsedPreflist]) of
+        {ok, Accepted} ->
+            {ok, lists:nthtail(Accepted, Inputs)};
+        {error, Error} ->
+            {error, Error}
+    end.
+
+%% @doc Partition Inputs into bins according to the head of their preflist.
+-spec partition_inputs(riak_pipe:fitting(), [term()]) ->
+         [{chash(), [term()]}].
+partition_inputs(Fitting, Inputs) ->
+    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+    lists:foldr(
+      fun(I, Acc) ->
+              P = riak_core_ring:responsible_index(
+                    work_hash(Fitting, I), Ring),
+              case lists:keytake(P, 1, Acc) of
+                  {value, {_, RestI}, NewAcc} ->
+                      [{P,[I|RestI]}|NewAcc];
+                  false ->
+                      [{P, [I]}|Acc]
+              end
+      end,
+      [],
+      Inputs).
 
 %% @doc Compute the elements of the preflist that have not been
 %%      attempted for this input yet.
